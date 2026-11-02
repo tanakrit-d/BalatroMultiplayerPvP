@@ -104,7 +104,9 @@ jobs:
               "$runtime" "$test_file"
             done
           done
-          git diff --check "$MOBILE_BASE" HEAD
+          # Upstream Lovely files use CRLF; carriage returns are not trailing spaces.
+          git -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol \
+            diff --check "$MOBILE_BASE" HEAD
 
       - name: Publish review branch and pull request
         if: steps.merge.outputs.needed == 'true'
