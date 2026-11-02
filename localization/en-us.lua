@@ -1456,6 +1456,7 @@ return {
 			k_pvp_sync_failed = "Round sync unconfirmed. Reconnect to retry.",
 			k_lives = "Lives",
 			k_skips = "Skips",
+			k_best_pvp_score = "Best PvP Score",
 			k_lost_life = "Lost a life",
 			k_total_lives_lost = " Total Lives Lost",
 			k_comeback_money_sandbox = " Comeback Money ($3 × ante cleared)",
@@ -1605,6 +1606,7 @@ return {
 			k_show_mp_content_anyway = "Show Multiplayer content anyway*",
 			k_applies_singleplayer_vanilla_rulesets = "*Applies in singleplayer and vanilla rulesets",
 			k_timer_sfx = "Timer Sound Effects",
+			k_queue_match_sound = "Play a sound when a match is found",
 			k_nemesis_layout = "Nemesis layout",
 			ml_nemesis_layout_opt = {
 				"Standard",

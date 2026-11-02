@@ -351,6 +351,18 @@ test("a query before the first hand does not fabricate a zero-hand report", func
 	equal(last("pvp_round_state").revisions.a, 0)
 end)
 
+test("after a lost PvP, newRound lets the ante timer take a life", function()
+	setup("pair")
+	report("a", 1, 500, 0)
+	report("b", 1, 100, 0)
+	equal(PVP.REF.players.b.lives, 3)
+	-- b's client sends newRound when the PvP ends (action_end_pvp).
+	PVP.referee_on_new_round("b")
+	PVP.referee_on_fail_timer("b")
+	equal(PVP.REF.players.b.lives, 2)
+	equal(last("pvp_player_lives").player_id, "b")
+end)
+
 test("host socket drop keeps the referee's result available after rejoin", function()
 	setup("pair")
 	report("a", 1, 100, 0)
@@ -436,6 +448,36 @@ test("real action handlers restore lives before ending the blind and ignore dupl
 	end
 	MPAPI.ActionTypes.pvp_win:on_receive("a", { winner_id = "a" })
 	equal(PVP.GAME.round_sync, nil)
+end)
+
+test("the opponent leaving after the result does not end the match again", function()
+	setup("pair")
+	MPAPI.ActionType = function(def)
+		MPAPI.ActionTypes[def.key] = def
+	end
+	dofile("pvp_api/actions/_helpers.lua")
+	dofile("pvp_api/actions/outcomes.lua")
+	local ends = {}
+	PVP.dispatch_action = function(action)
+		ends[#ends + 1] = action
+	end
+	PVP.end_pending_death = function() end
+	PVP.release_held_result = function() end
+	MPAPI.has_server_referee = function()
+		return false
+	end
+	-- a lost; b then leaves the end screen, so a is the single survivor.
+	MPAPI.ActionTypes.pvp_win:on_receive("a", { winner_id = "b" })
+	MPAPI.ActionTypes.pvp_player_won:on_receive("a", { player_id = "a" })
+	MPAPI.ActionTypes.pvp_win:on_receive("a", { winner_id = "b" })
+	equal(#ends, 1)
+	equal(ends[1], "loseGame")
+	-- A mid-match forfeit still ends the run.
+	PVP.GAME = {}
+	ends = {}
+	MPAPI.ActionTypes.pvp_player_won:on_receive("a", { player_id = "a" })
+	equal(#ends, 1)
+	equal(ends[1], "winGame")
 end)
 
 test("a new run clears archived results and rejects a previous run's report", function()
