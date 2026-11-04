@@ -1,5 +1,11 @@
 -- Plain Lua test for G.FUNCS.load_nemesis_deck (networking/action_handlers.lua).
 -- Run from the repo root: luajit tests/unit/nemesis_deck_test.lua
+-- The extracted game function uses goto, supported by LÖVE's LuaJIT but not Lua 5.1.
+if not (loadstring or load)("::label::") then
+	print("SKIP nemesis_deck_test: requires goto support; run with LuaJIT")
+	return
+end
+
 G = {
 	FUNCS = {},
 	CARD_W = 1,

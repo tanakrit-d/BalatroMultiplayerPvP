@@ -39,7 +39,7 @@ local function setup(cfg)
 			PVP.GAME.timer = math.max(0, PVP.GAME.timer - a)
 		end
 	end
-	load(chunk)()
+	assert((loadstring or load)(chunk))()
 end
 local function own()
 	PVP.GAME.skips_before_pvp = (PVP.GAME.skips_before_pvp or 0) + 1
