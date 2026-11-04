@@ -135,10 +135,10 @@ local OUTCOME_RESENDS = { 3, 8 }
 
 local function declare_outcome(params)
 	PVP.REF.last_outcome = params
-	sendDebugMessage(
+	PVP.match_log(
+		"debug",
 		"[pvp] referee declares pvp_win winner="
-			.. tostring(params.winner_id or params.winner_team_id or (params.draw and "draw")),
-		"MULTIPLAYER"
+			.. tostring(params.winner_id or params.winner_team_id or (params.draw and "draw"))
 	)
 	broadcast("pvp_win", params)
 	if not (G and G.E_MANAGER) then
@@ -166,7 +166,7 @@ function PVP.referee_on_result_request(from)
 	if not is_host() or not PVP.REF.last_outcome then
 		return
 	end
-	sendDebugMessage("[pvp] resending pvp_win on request from " .. tostring(from), "MULTIPLAYER")
+	PVP.match_log("debug", "[pvp] resending pvp_win on request from " .. tostring(from))
 	broadcast("pvp_win", PVP.REF.last_outcome)
 end
 
@@ -846,15 +846,23 @@ function PVP.roster_from_team_plan(plan)
 	return roster
 end
 
+-- What the referee last announced belongs to one match. Any client may have hosted an
+-- earlier one, and could become host again by takeover.
+local function forget_announced_outcome()
+	PVP.REF.last_outcome = nil
+	PVP.REF.many_result_sent = nil
+end
+
 function PVP.referee_reset(starting_lives)
+	forget_announced_outcome()
 	if not is_host() then
 		return
 	end
 	PVP.REF.players = {}
 	PVP.REF.round = nil
 	PVP.REF.retired_rounds = {}
-	PVP.REF.last_outcome = nil
 	PVP.REF.first_ready_at = nil
+	PVP.REF.ready_check = nil
 	if PVP.REF.ready_tracker then
 		PVP.REF.ready_tracker:reset()
 	end
@@ -870,7 +878,6 @@ function PVP.referee_reset(starting_lives)
 	PVP.REF.pending_deaths = {}
 	PVP.REF.many_hold = nil
 	PVP.REF.team_pending = nil
-	PVP.REF.many_result_sent = nil
 	PVP.REF.blind_results = {}
 	local lives = starting_lives or PVP.LOBBY.config.starting_lives or 4
 	local total = both_players()
@@ -972,16 +979,49 @@ function PVP.referee_reset(starting_lives)
 end
 
 -- loseLife(): decrement once per round (guarded by lives_blocker, re-armed by
--- newRound). Broadcasts the loser's new life count to everyone. `lost` marks a
+-- newRound). An Ante timer run-out passes `unguarded`: it costs a life every time
+-- and leaves the guard alone, so a failed blind in the same round still costs one.
+-- Broadcasts the loser's new life count to everyone. `lost` marks a
 -- real loss (as opposed to the setup/restore/takeover broadcasts of a count),
 -- so the loser's client can log life_lost for the achievements.
-local function lose_life(pl)
-	if pl.lives_blocker or pl.lives <= 0 then
+local function lose_life(pl, unguarded)
+	if (pl.lives_blocker and not unguarded) or pl.lives <= 0 then
 		return
 	end
 	pl.lives = pl.lives - 1
-	pl.lives_blocker = true
+	if not unguarded then
+		pl.lives_blocker = true
+	end
 	broadcast("pvp_player_lives", { player_id = pl.id, lives = pl.lives, lost = 1 })
+end
+
+-- The teammates of `team` (everyone of it still in the lobby), as ref players.
+local function teammates(team)
+	local mates = {}
+	for _, id in ipairs(both_players()) do
+		local other = ref_player(id)
+		if other.team_id == team then
+			mates[#mates + 1] = other
+		end
+	end
+	return mates
+end
+
+-- The failed-blind guard of a team is kept on every teammate's lives_blocker, so the
+-- run save carries it and a save with one flagged teammate still guards the team.
+local function team_guarded(team)
+	for _, other in ipairs(teammates(team)) do
+		if other.lives_blocker then
+			return true
+		end
+	end
+	return false
+end
+
+local function set_team_guard(team, value)
+	for _, other in ipairs(teammates(team)) do
+		other.lives_blocker = value
+	end
 end
 
 -- Teams-aware life loss for the fail_round/fail_timer/fail_pvp_timer paths below
@@ -990,16 +1030,18 @@ end
 -- unchanged); Teams must decrement its SHARED pool once and mirror the new value
 -- onto every teammate, or these paths would desync an individual's pl.lives from
 -- their team's actual pool (the pool is the only thing check_team_win reads).
-local function team_lose_life(pl)
+local function team_lose_life(pl, unguarded)
 	if not PVP.LOBBY.config.team_based then
-		lose_life(pl)
+		lose_life(pl, unguarded)
 		return
 	end
-	if pl.lives_blocker then
-		return
-	end
-	pl.lives_blocker = true
 	local team = pl.team_id
+	if not unguarded then
+		if team_guarded(team) then
+			return
+		end
+		set_team_guard(team, true)
+	end
 	PVP.REF.team_lives[team] = (PVP.REF.team_lives[team] or 1) - 1
 	broadcast("pvp_team_lives", { team_id = team, lives = PVP.REF.team_lives[team] })
 	for _, id in ipairs(both_players()) do
@@ -1011,12 +1053,142 @@ local function team_lose_life(pl)
 	end
 end
 
--- readyBlind: both ready -> compute firstPlayer, reset per-blind state, start blind.
--- The 2-player path (below) is untouched. For N>2 (Royale) there's no meaningful
+-- readyBlind: both ready -> ask them to confirm, then compute firstPlayer, reset
+-- per-blind state, start blind. For N>2 (Royale) there's no meaningful
 -- "first player" HUD ordering, so that concept is dropped and readiness is just
 -- "every alive player has readied", via MPAPI.ReadyTracker()'s set/is_ready/reset
 -- primitives (checked against alive_ids() ourselves rather than its own all_ready(),
 -- which loops the full lobby roster and would stall on eliminated spectators).
+--
+-- A stored Ready can be stale (one that arrives after its blind already started stays
+-- set), so the start waits on a ready check: every player is asked whether they are
+-- ready now and only answers of yes start the blind (lib/ready_check.lua).
+local READY_CHECK_TIMEOUT = 2
+local ready_check_count = 0
+
+-- Whether the referee still holds `id` as ready (the tracker in matches of 3 or more).
+-- `many` is the path the check opened on; the lobby may shrink while it runs.
+local function marked_ready(id, many)
+	if many then
+		return PVP.REF.ready_tracker ~= nil and PVP.REF.ready_tracker:is_ready(id)
+	end
+	return ref_player(id).is_ready
+end
+
+local function clear_ready(id)
+	ref_player(id).is_ready = false
+	if PVP.REF.ready_tracker then
+		PVP.REF.ready_tracker:set(id, false)
+	end
+end
+
+local function start_blind_many(alive)
+	PVP.REF.ready_tracker:reset()
+	for _, id in ipairs(alive) do
+		local pl = ref_player(id)
+		pl.score = PVP.Score.ZERO
+		pl.hands_left = 4
+		pl.played_this_blind = false
+	end
+	local round_id = begin_round(alive)
+	broadcast("pvp_start_blind", { first_player = "", starting_hands = starting_hands_by_id(alive), round_id = round_id })
+	-- Show fresh (0) values on the live target board immediately, not stale
+	-- ones from the round that just ended.
+	broadcast_live_targets()
+end
+
+local function start_blind_2p(from, opp)
+	local me, enemy = ref_player(from), ref_player(opp)
+	me.is_ready = false
+	enemy.is_ready = false
+	me.score = PVP.Score.ZERO
+	enemy.score = PVP.Score.ZERO
+	me.hands_left = 4
+	enemy.hands_left = 4
+	me.played_this_blind = false
+	enemy.played_this_blind = false
+	local round_id = begin_round({ from, opp })
+
+	-- firstPlayer is the id of whichever player readied first.
+	local first_id = me.first_ready and from or (enemy.first_ready and opp or nil)
+	broadcast("pvp_start_blind", {
+		first_player = first_id or "",
+		starting_hands = starting_hands_by_id({ from, opp }),
+		round_id = round_id,
+	})
+end
+
+-- The answers are in: start the blind if everyone is still marked ready (an unready
+-- may have come in while they were out).
+local function finish_ready_check(check)
+	PVP.REF.ready_check = nil
+	if check.many then
+		local alive = alive_ids()
+		for _, id in ipairs(alive) do
+			if not marked_ready(id, true) then
+				return
+			end
+		end
+		start_blind_many(alive)
+		return
+	end
+	-- Someone who was asked and left must not have the blind start against them.
+	local present = {}
+	for _, id in ipairs(both_players()) do
+		present[id] = true
+	end
+	for _, id in ipairs(check.ids) do
+		if not present[id] or not marked_ready(id, false) then
+			return
+		end
+	end
+	local opp = opponent_of(check.trigger)
+	if opp then
+		start_blind_2p(check.trigger, opp)
+	end
+end
+
+local function settle_ready_check(check, outcome, refuser)
+	if outcome == PVP.ReadyCheck.Outcome.PENDING then
+		return
+	end
+	if outcome == PVP.ReadyCheck.Outcome.REFUSED then
+		-- The refuser is not on the blind-select screen, so its stored Ready was stale.
+		-- The others stay ready and the blind waits for a Ready that is real.
+		PVP.REF.ready_check = nil
+		clear_ready(refuser)
+		ref_player(refuser).first_ready = false
+		PVP.match_log("debug", "[pvp] ready check refused by " .. tostring(refuser) .. ": dropped its stale ready")
+		return
+	end
+	finish_ready_check(check)
+end
+
+local function open_ready_check(trigger, ids)
+	ready_check_count = ready_check_count + 1
+	local nonce = tostring(os.time()) .. "-" .. ready_check_count
+	local check = PVP.ReadyCheck.new(nonce, ids, trigger)
+	-- Which readiness record applies is fixed now: players leaving mid-check must not switch it.
+	check.many = #both_players() > 2
+	PVP.REF.ready_check = check
+	broadcast("pvp_ready_check", { nonce = nonce, players = ids })
+	G.E_MANAGER:add_event(Event({
+		trigger = "after",
+		delay = READY_CHECK_TIMEOUT,
+		timer = "REAL",
+		pause_force = true,
+		blocking = false,
+		blockable = false,
+		func = function()
+			-- Still the open check: whoever never answered gets the benefit of the doubt.
+			if PVP.REF.ready_check == check then
+				settle_ready_check(check, PVP.ReadyCheck.on_timeout(check))
+			end
+			return true
+		end,
+	}))
+end
+
 function PVP.referee_on_ready_blind(from, starting_hands, round_protocol)
 	if not is_host() then
 		return
@@ -1035,19 +1207,8 @@ function PVP.referee_on_ready_blind(from, starting_hands, round_protocol)
 				break
 			end
 		end
-		if all_ready then
-			PVP.REF.ready_tracker:reset()
-			for _, id in ipairs(alive) do
-				local pl = ref_player(id)
-				pl.score = PVP.Score.ZERO
-				pl.hands_left = 4
-				pl.played_this_blind = false
-			end
-			local round_id = begin_round(alive)
-			broadcast("pvp_start_blind", { first_player = "", starting_hands = starting_hands_by_id(alive), round_id = round_id })
-			-- Show fresh (0) values on the live target board immediately, not stale
-			-- ones from the round that just ended.
-			broadcast_live_targets()
+		if all_ready and not PVP.REF.ready_check then
+			open_ready_check(from, alive)
 		end
 		return
 	end
@@ -1061,24 +1222,8 @@ function PVP.referee_on_ready_blind(from, starting_hands, round_protocol)
 		me.first_ready = true
 	end
 
-	if enemy and me.is_ready and enemy.is_ready then
-		me.is_ready = false
-		enemy.is_ready = false
-		me.score = PVP.Score.ZERO
-		enemy.score = PVP.Score.ZERO
-		me.hands_left = 4
-		enemy.hands_left = 4
-		me.played_this_blind = false
-		enemy.played_this_blind = false
-		local round_id = begin_round({ from, opp })
-
-		-- firstPlayer is the id of whichever player readied first.
-		local first_id = me.first_ready and from or (enemy.first_ready and opp or nil)
-		broadcast("pvp_start_blind", {
-			first_player = first_id or "",
-			starting_hands = starting_hands_by_id({ from, opp }),
-			round_id = round_id,
-		})
+	if enemy and me.is_ready and enemy.is_ready and not PVP.REF.ready_check then
+		open_ready_check(from, { from, opp })
 	end
 end
 
@@ -1086,7 +1231,38 @@ function PVP.referee_on_unready_blind(from)
 	if not is_host() then
 		return
 	end
-	ref_player(from).is_ready = false
+	clear_ready(from)
+	-- Whoever was just asked is no longer all ready.
+	PVP.REF.ready_check = nil
+end
+
+-- A player's answer to pvp_ready_check: whether they are on the blind-select screen,
+-- readied, right now.
+function PVP.referee_on_ready_ack(from, nonce, ready)
+	if not is_host() then
+		return
+	end
+	local check = PVP.REF.ready_check
+	if not check then
+		return
+	end
+	settle_ready_check(check, PVP.ReadyCheck.answer(check, nonce, from, ready))
+end
+
+-- A new host keeps the checkpoint's Ready flags but not the check that was open, so it
+-- asks again instead of leaving everyone on Ready.
+local function resume_ready_check()
+	local many = #both_players() > 2
+	local ids = many and alive_ids() or both_players()
+	if #ids < 2 or PVP.REF.ready_check then
+		return
+	end
+	for _, id in ipairs(ids) do
+		if not marked_ready(id, many) then
+			return
+		end
+	end
+	open_ready_check(ids[1], ids)
 end
 
 -- Pure: given the 2-player round-end state, decides whether the round is over
@@ -1628,7 +1804,11 @@ function PVP.referee_on_new_round(from)
 	if not is_host() then
 		return
 	end
-	ref_player(from).lives_blocker = false
+	local pl = ref_player(from)
+	pl.lives_blocker = false
+	if PVP.LOBBY.config.team_based then
+		set_team_guard(pl.team_id, false)
+	end
 end
 
 -- failRound: mode-dependent life loss (death_on_round_loss) and match end.
@@ -1681,7 +1861,7 @@ function PVP.referee_on_fail_timer(from)
 		return
 	end
 	local pl = ref_player(from)
-	team_lose_life(pl)
+	team_lose_life(pl, true)
 	if PVP.REF.pending_death then
 		resolve_pending_death()
 		return
@@ -2009,6 +2189,7 @@ local function restore(snap)
 			PVP.REF.ready_tracker:set(id, true)
 		end
 	end
+	PVP.REF.ready_check = nil
 	PVP.REF.first_ready_at = nil
 	PVP.REF.nemesis_of = snap.nemesis_of or {}
 	PVP.REF.used_pairs = snap.used_pairs or {}
@@ -2027,12 +2208,33 @@ local function restore(snap)
 	PVP.REF.retired_rounds = snap.retired_rounds or {}
 end
 
+-- Everyone the match started with, so a player who already left still counts as a
+-- player of it (the 2-player rules and a pending death need both). The lobby's
+-- game record is the fallback when this client has no start snapshot.
+local function match_player_ids(lobby)
+	local started = lobby._game and lobby._game.started
+	local players = {}
+	for _, list in ipairs({ PVP._match_players or {}, started and started.players or {}, lobby:get_players() }) do
+		if #list > 0 then
+			players = list
+			break
+		end
+	end
+	local ids = {}
+	for _, p in ipairs(players) do
+		ids[#ids + 1] = p.id
+	end
+	return ids
+end
+
 -- No checkpoint to take over (an old host on an older build, or one that
 -- crashed before its first write): rebuild what this client saw itself. Lives
 -- are the part that decides the match, and every client hears every change to
 -- its own and its opponent's (pvp_player_lives). Scores and hands come back as
 -- each player plays its next hand.
 local function rebuild_from_local(lobby)
+	-- Only the old host knew it had asked for the hold; the server's own flag is what is true.
+	local held = lobby:is_result_pending()
 	PVP.REF.players = {}
 	PVP.REF.round = nil
 	PVP.REF.retired_rounds = {}
@@ -2043,14 +2245,14 @@ local function rebuild_from_local(lobby)
 	PVP.REF.many_hold = nil
 	for id, blind_key in pairs(PVP.GAME.pending_deaths or {}) do
 		PVP.PendingDeath.add_pending(PVP.REF.pending_deaths, id, blind_key, {})
-		PVP.REF.many_hold = PVP.GAME.result_held and PVP.ManyHold.HELD or PVP.ManyHold.NONE
+		PVP.REF.many_hold = held and PVP.ManyHold.HELD or PVP.ManyHold.NONE
 	end
 	PVP.REF.team_pending = nil
 	if PVP.GAME.team_pending then
 		PVP.REF.team_pending = {
 			team_id = PVP.GAME.team_pending.team_id,
 			blind_key = PVP.GAME.team_pending.blind_key,
-			held = PVP.GAME.result_held and 1 or 0,
+			held = held and 1 or 0,
 		}
 	end
 	local seen = PVP.GAME.pending_death
@@ -2060,19 +2262,19 @@ local function rebuild_from_local(lobby)
 			player_id = seen.player_id,
 			opponent_id = seen.opponent_id,
 			blind_key = seen.blind_key,
-			held = PVP.GAME.result_held and 1 or 0,
+			held = held and 1 or 0,
 		}
 	end
 	local target = PVP.current_target_id()
-	for _, p in ipairs(lobby:get_players()) do
-		local pl = ref_player(p.id)
-		pl.team_id = PVP.LOBBY.roster and PVP.LOBBY.roster[p.id] or nil
+	for _, id in ipairs(match_player_ids(lobby)) do
+		local pl = ref_player(id)
+		pl.team_id = PVP.LOBBY.roster and PVP.LOBBY.roster[id] or nil
 		local lives
-		if p.id == lobby.player_id then
+		if id == lobby.player_id then
 			lives = PVP.GAME.lives
-		elseif PVP._player_lives_cache and PVP._player_lives_cache[p.id] then
-			lives = PVP._player_lives_cache[p.id]
-		elseif p.id == target and PVP.GAME.enemy then
+		elseif PVP._player_lives_cache and PVP._player_lives_cache[id] then
+			lives = PVP._player_lives_cache[id]
+		elseif id == target and PVP.GAME.enemy then
 			lives = PVP.GAME.enemy.lives
 		end
 		if tonumber(lives) and tonumber(lives) > 0 then
@@ -2152,6 +2354,7 @@ function PVP.referee_take_over()
 	if not lobby then
 		return nil
 	end
+	forget_announced_outcome()
 	local snap = (lobby:get_metadata() or {})[CHECKPOINT_KEY]
 	local source
 	if type(snap) == "table" and snap.v == 1 and snap.tag ~= nil and snap.tag == run_tag() then
@@ -2170,7 +2373,7 @@ function PVP.referee_take_over()
 	PVP.GAME.result_held = (PVP.REF.pending_death ~= nil and PVP.REF.pending_death.held == 1)
 		or PVP.REF.many_hold == PVP.ManyHold.HELD
 		or (PVP.REF.team_pending ~= nil and PVP.REF.team_pending.held == 1)
-	sendDebugMessage("[pvp] took over the referee from " .. source, "MULTIPLAYER")
+	PVP.match_log("debug", "[pvp] took over the referee from " .. source)
 	PVP._ref_takeover = { source = source, at = love.timer and love.timer.getTime() or os.time() }
 	-- Everyone's Lives box reads the referee's record from here on.
 	for id, pl in pairs(PVP.REF.players) do
@@ -2186,6 +2389,7 @@ function PVP.referee_take_over()
 	resolve_team_pending()
 	settle_many_pending()
 	forfeit_departed(lobby)
+	resume_ready_check()
 	PVP.referee_checkpoint()
 	return source
 end
@@ -2216,6 +2420,7 @@ for _, name in ipairs({
 	"referee_on_player_reconnected",
 	"referee_on_ready_blind",
 	"referee_on_unready_blind",
+	"referee_on_ready_ack",
 	"referee_on_play_hand",
 	"referee_on_skip",
 	"referee_on_set_ante",

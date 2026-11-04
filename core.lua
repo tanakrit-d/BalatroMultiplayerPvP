@@ -1,5 +1,13 @@
 PVP = SMODS.current_mod
 
+-- PvP's one way to write a debug, info or trace line (level "debug", "info" or
+-- "trace"). All PvP lines carry match data, so they go through the MPAPI gate
+-- and appear only with the Dev mod. Warnings and errors call sendWarnMessage
+-- and sendErrorMessage directly.
+function PVP.match_log(level, msg)
+	MPAPI.match_log(level, msg, "MULTIPLAYER")
+end
+
 PVP.BANNED_MODS = {
 	["Incantation"] = true,
 	["Brainstorm"] = true,
@@ -92,7 +100,7 @@ if env_info then
 				end
 			end
 		end
-		sendDebugMessage("Loaded .env overrides", "MULTIPLAYER")
+		PVP.match_log("debug", "Loaded .env overrides")
 	end
 end
 
@@ -114,12 +122,14 @@ end
 
 -- §20: register our own predicates through the API's generic extension points
 -- (MPAPI.register_order_gate/register_voucher_queue_gate/register_idol_gate) rather than the API
--- reading PVP.* globals directly. Practice mode always uses the order; otherwise a
--- lobby with the_order enabled does -- exactly the previous PVP-compat branch's logic.
+-- reading PVP.* globals directly. Playback uses the recorded The Order setting;
+-- practice and live lobbies use their own config.
 MPAPI.register_order_gate(function()
-	return (PVP.is_practice_mode and PVP.is_practice_mode())
-		or (PVP.LOBBY and PVP.LOBBY.config and PVP.LOBBY.config.the_order and PVP.LOBBY.code ~= nil)
-		or false
+	local config = PVP.LOBBY and PVP.LOBBY.config
+	if not (config and config.the_order) then
+		return false
+	end
+	return (PVP.is_practice_mode() or PVP.LOBBY.code ~= nil) and true or false
 end)
 
 -- MLBa plays without The Order, but its voucher queue and The Idol's card follow it.
@@ -196,7 +206,7 @@ PVP.load_mp_dir("lib")
 PVP.load_mp_dir("overrides")
 
 function PVP.reset_lobby_config(persist_ruleset_and_gamemode)
-	sendDebugMessage("Resetting lobby options", "MULTIPLAYER")
+	PVP.match_log("debug", "Resetting lobby options")
 	PVP.LOBBY.config = {
 		gold_on_life_loss = true,
 		no_gold_on_round_loss = false,
@@ -237,7 +247,7 @@ end
 PVP.reset_lobby_config()
 
 function PVP.reset_game_states()
-	sendDebugMessage("Resetting game states", "MULTIPLAYER")
+	PVP.match_log("debug", "Resetting game states")
 	-- §17.10: fresh per-match roster collection -- must not carry over from
 	-- whatever match (if any) this player was previously in.
 	PVP._collected_results = {}
@@ -266,6 +276,7 @@ function PVP.reset_game_states()
 			-- " (catching up)" while the target is replaying its run after a crash, else "".
 			catching_up_text = "",
 			skips = 0,
+			skips_before_pvp = 0,
 			lives = PVP.LOBBY.config.starting_lives,
 			sells = 0,
 			sells_per_ante = {},
@@ -281,6 +292,8 @@ function PVP.reset_game_states()
 		duplicate_end = false,
 		misprint_display = "",
 		spent_total = 0,
+		skips_before_pvp = 0,
+		skips_difference = 0,
 		spent_before_shop = 0,
 		highest_score = PVP.Score.ZERO,
 		-- §17.10: PVP.GAME.highest_score above tracks the best SINGLE-BLIND
@@ -506,10 +519,12 @@ MPAPI.on_loaded(function()
 			n = n + 1
 		end
 	end
-	sendDebugMessage(
-		"[pvp] boot: pvp ActionTypes registered=" .. n .. " pvp_player_ready="
-			.. tostring(MPAPI.ActionTypes and MPAPI.ActionTypes["pvp_player_ready"] ~= nil),
-		"MULTIPLAYER"
+	PVP.match_log(
+		"debug",
+		"[pvp] boot: pvp ActionTypes registered="
+			.. n
+			.. " pvp_player_ready="
+			.. tostring(MPAPI.ActionTypes and MPAPI.ActionTypes["pvp_player_ready"] ~= nil)
 	)
 
 	MPAPI.on_connection_state_change(function()

@@ -147,7 +147,8 @@ local TRAPS = {
 			if context.data.owner ~= PVP.TRAP.self_id() then
 				return
 			end
-			if context.data.key then
+			-- The copy needs a free Joker slot, else it is lost.
+			if context.data.key and #G.jokers.cards + G.GAME.joker_buffer < G.jokers.config.card_limit then
 				-- set required -- see glyph_of_warding's comment above (SMODS.add_card
 				-- never infers it from the target center).
 				SMODS.add_card({ key = context.data.key, set = "Joker", area = G.jokers })
@@ -235,7 +236,7 @@ local TRAPS = {
 			if context.skip_blind then
 				-- Recorded by lib/trap_utils_snare.lua: other tags may be added before this context runs.
 				PVP.TRAP.reveal_and_consume(card)
-				return PVP.TRAP.notify_owner(card, { tag_key = G.GAME.mp_skipped_tag_key })
+				return PVP.TRAP.notify_owner(card, { tag_key = G.GAME.mp_skipped_tag_key, orbital_hand = G.GAME.mp_skipped_orbital_hand })
 			end
 		end,
 		receive = function(self, context)
@@ -243,7 +244,14 @@ local TRAPS = {
 				return
 			end
 			if context.data.tag_key then
-				add_tag(Tag(context.data.tag_key))
+				-- Same as the Double Tag: the copy keeps the original's poker hand.
+				G.orbital_hand = context.data.orbital_hand
+				local copy = Tag(context.data.tag_key)
+				G.orbital_hand = nil
+				add_tag(copy)
+				-- add_tag does not run a tag that acts at once (Economy, Orbital, ...): vanilla only does that
+				-- on a skip, which the Trapper has not made.
+				copy:apply_to_run({ type = "immediate" })
 			end
 			PVP.UI.show_trap_fired_animation("Snare")
 		end,
@@ -290,7 +298,8 @@ local TRAPS = {
 		art = "Ganpan140",
 		code = "Virtualized",
 		calculate = function(self, card, context)
-			if context.using_consumeable then
+			-- A Trap card taken from a Trap pack is a plant, not a use: a copy would be a dead card.
+			if context.using_consumeable and context.consumeable.config.center.set ~= "Trap" then
 				PVP.TRAP.reveal_and_consume(card)
 				-- `set` must travel with the key: unlike sepia_snake_sigil/glyph_of_warding
 				-- (always one fixed type), Web can copy ANY consumable set (Tarot/Planet/

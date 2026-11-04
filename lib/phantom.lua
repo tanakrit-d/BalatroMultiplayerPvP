@@ -8,6 +8,31 @@ function SMODS.get_card_areas(_type, _context)
 	return get_card_areas_ref(_type, _context)
 end
 
+-- The opponent's jokers (Phantom copies, the opponent's jokers on the end screen) roll on the opponent's game:
+-- this player's Oops! All 6s and other probability jokers must not change the odds they show.
+local get_probability_vars_ref = SMODS.get_probability_vars
+function SMODS.get_probability_vars(trigger_obj, base_numerator, base_denominator, identifier, from_roll, no_mod)
+	local opponents = type(trigger_obj) == "table"
+		and trigger_obj.ability ~= nil
+		and (
+			PVP.is_phantom(trigger_obj)
+			or (
+				trigger_obj.area ~= nil
+				and trigger_obj.area == PVP.end_game_jokers
+				and PVP._end_screen_selected_player_id ~= MPAPI.connection_state.player_id
+			)
+		)
+	-- Only the shown odds change: a roll (from_roll) keeps this player's own modifiers.
+	return get_probability_vars_ref(
+		trigger_obj,
+		base_numerator,
+		base_denominator,
+		identifier,
+		from_roll,
+		no_mod or (opponents and not from_roll)
+	)
+end
+
 -- The eternal sticker alone does not stop a sale: Steamodded ignores it on jokers that are not eternal-compatible.
 local can_sell_card_ref = Card.can_sell_card
 function Card:can_sell_card(context)
@@ -77,6 +102,8 @@ end
 local delete_run_ref = Game.delete_run
 function Game:delete_run()
 	remove_nemesis_slots()
+	-- The end screen's Nemesis deck area dies with the run too, so a late deck reply finds nothing to load into.
+	PVP.nemesis_deck, PVP.nemesis_cards = nil, nil
 	return delete_run_ref(self)
 end
 

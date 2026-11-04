@@ -95,6 +95,16 @@ local function eval_hand_and_jokers()
 				})
 				if eval then table.insert(effects, eval) end
 			end
+			-- Consumables (planted Trap cards) hear the same held-card payout as jokers, as in a normal round.
+			for k = 1, #G.consumeables.cards do
+				local eval = G.consumeables.cards[k]:calculate_joker({
+					cardarea = G.hand,
+					other_card = G.hand.cards[i],
+					individual = true,
+					end_of_round = true,
+				})
+				if type(eval) == "table" and next(eval) then table.insert(effects, eval) end
+			end
 
 			if reps[j] == 1 then
 				--Check for hand doubling
@@ -493,7 +503,7 @@ function PVP.handle_duplicate_end()
 		if PVP.GAME.round_ended then
 			if not PVP.GAME.duplicate_end then
 				PVP.GAME.duplicate_end = true
-				sendDebugMessage("Duplicate end_round calls prevented.", "MULTIPLAYER")
+				PVP.match_log("debug", "Duplicate end_round calls prevented.")
 			end
 			return true
 		end

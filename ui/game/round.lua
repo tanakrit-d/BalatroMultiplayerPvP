@@ -65,6 +65,18 @@ function reset_blinds()
 	end
 end
 
+-- A Boss Tag (or any other reroll) must never swap the PvP blind for a normal boss: the
+-- opponent would still wait in the PvP blind while this player plays a vanilla one.
+local reroll_boss_ref = G.FUNCS.reroll_boss
+function G.FUNCS.reroll_boss(e)
+	local blind_choices = G.GAME and G.GAME.round_resets and G.GAME.round_resets.blind_choices
+	if PVP.in_session() and blind_choices and blind_choices.Boss == "bl_mp_nemesis" then
+		G.from_boss_tag = nil
+		return true
+	end
+	return reroll_boss_ref(e)
+end
+
 -- necessary for showdown mode to ensure rounds progress properly, only affects nemesis blind to avoid possible incompatibilities (though i know many mods like to do this exact hook)
 local blind_get_type = Blind.get_type
 function Blind:get_type()

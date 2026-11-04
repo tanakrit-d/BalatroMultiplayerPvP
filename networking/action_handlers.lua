@@ -29,7 +29,7 @@ Client = {}
 function Client.send(msg)
 	msg = json.encode(msg)
 	if msg ~= '{"action":"keepAliveAck"}' then
-		sendTraceMessage(string.format("Client sent message: %s", msg), "MULTIPLAYER")
+		PVP.match_log("trace", string.format("Client sent message: %s", msg))
 	end
 	love.thread.getChannel("uiToNetwork"):push(msg)
 end
@@ -345,7 +345,7 @@ end
 
 local function action_start_game(p)
 	local seed = p.seed
-	sendDebugMessage(string.format("Game starting — %s", os.date("%Y-%m-%dT%H:%M:%S%z")), "MULTIPLAYER")
+	PVP.match_log("debug", string.format("Game starting — %s", os.date("%Y-%m-%dT%H:%M:%S%z")))
 	-- Clear any stale practice state so it can't leak into real PVP
 	PVP.SP.practice = false
 
@@ -442,6 +442,9 @@ local function action_start_blind(p)
 	stop_timers()
 	PVP.GAME.timer_consumed = false
 	PVP.GAME.timer = PVP.UTILS.pvp_timer_base()
+	PVP.GAME.skips_before_pvp = 0
+	PVP.GAME.enemy.skips_before_pvp = 0
+	PVP.GAME.skips_difference = 0
 	PVP.GAME.pvp_reached_first = (PVP.LOBBY.is_host and "host" or "guest") == first_player
 	PVP.UI.start_pvp_countdown(begin_pvp_blind)
 end
@@ -457,7 +460,6 @@ local function action_stop_game()
 		PVP.reset_game_states()
 	end
 	PVP.RLOG.end_run({ result = "stop" })
-	PVP.UTILS.emit_log_checksum()
 end
 
 local function action_end_pvp(p)
@@ -476,6 +478,9 @@ local function action_end_pvp(p)
 	PVP.GAME.pvp_reached = false
     PVP.GAME.pvp_reached_first = false
 	PVP.GAME.score = nil
+	PVP.GAME.skips_before_pvp = 0
+	PVP.GAME.enemy.skips_before_pvp = 0
+	PVP.GAME.skips_difference = 0
 	-- The PvP is over: clear the referee's lives blocker now, not at the next blind
 	-- select, so an ante timer running out on the cash out or in the shop costs a life.
 	Client.send({ action = "newRound" })
@@ -505,7 +510,6 @@ local function action_win_game()
 	PVP.STATS.record_match(true)
 	PVP.RLOG.end_run({ result = "win" })
 	PVP.UTILS.log_mem_debug_messages()
-	PVP.UTILS.emit_log_checksum()
 	PVP.report_roster_result()
 	-- pvp_win can fire while the winner is still mid-HAND_PLAYED (last hand
 	-- exhausted hands_left before the opponent's result arrived). Unlike
@@ -527,7 +531,6 @@ local function action_lose_game()
 	G.STATE = G.STATES.GAME_OVER
 	PVP.RLOG.end_run({ result = "loss" })
 	PVP.UTILS.log_mem_debug_messages()
-	PVP.UTILS.emit_log_checksum()
 	PVP.report_roster_result()
 end
 
@@ -547,7 +550,6 @@ local function action_draw_game()
 	G.STATE = G.STATES.GAME_OVER
 	PVP.RLOG.end_run({ result = "draw" })
 	PVP.UTILS.log_mem_debug_messages()
-	PVP.UTILS.emit_log_checksum()
 	PVP.report_roster_result()
 end
 
@@ -658,14 +660,14 @@ function G.FUNCS.load_end_game_jokers()
 
 	card_area_save, err = MPAPI.decode(PVP.end_game_jokers_payload)
 	if not card_area_save then
-		sendDebugMessage(string.format("Failed to unpack enemy jokers: %s", err), "MULTIPLAYER")
+		PVP.match_log("debug", string.format("Failed to unpack enemy jokers: %s", err))
 		return
 	end
 
 	-- Avoid crashing if the load function ends up indexing a nil value
 	success, err = pcall(PVP.end_game_jokers.load, PVP.end_game_jokers, card_area_save)
 	if not success then
-		sendDebugMessage(string.format("Failed to load enemy jokers: %s", err), "MULTIPLAYER")
+		PVP.match_log("debug", string.format("Failed to load enemy jokers: %s", err))
 		-- Reset the card area if loading fails to avoid inconsistent state
 		PVP.end_game_jokers:remove()
 		PVP.end_game_jokers:init(
@@ -685,7 +687,7 @@ function G.FUNCS.load_end_game_jokers()
 		for _, card in pairs(PVP.end_game_jokers.cards) do
 			jokers_str = jokers_str .. ";" .. PVP.UTILS.joker_to_string(card)
 		end
-		sendTraceMessage(string.format("Received end game jokers: %s", jokers_str), "MULTIPLAYER")
+		PVP.match_log("trace", string.format("Received end game jokers: %s", jokers_str))
 	end
 end
 
@@ -709,7 +711,7 @@ local function action_get_end_game_jokers()
 	for _, card in pairs(G.jokers.cards) do
 		jokers_str = jokers_str .. ";" .. PVP.UTILS.joker_to_string(card)
 	end
-	sendTraceMessage(string.format("Sending end game jokers: %s", jokers_str), "MULTIPLAYER")
+	PVP.match_log("trace", string.format("Sending end game jokers: %s", jokers_str))
 
 	local jokers_save = G.jokers:save()
 	local jokers_encoded = MPAPI.encode(jokers_save)
@@ -762,7 +764,17 @@ local function action_send_game_stats()
 end
 
 function G.FUNCS.load_nemesis_deck()
-	if not PVP.nemesis_deck_string or not PVP.nemesis_deck or not PVP.nemesis_cards or not PVP.LOBBY.code then return end
+	-- nemesis_deck.cards is nil once a finished run has removed the area. Loading into it
+	-- would error after each card was already added to our own deck, leaving it there.
+	if
+		not PVP.nemesis_deck_string
+		or not PVP.nemesis_deck
+		or not PVP.nemesis_deck.cards
+		or not PVP.nemesis_cards
+		or not PVP.LOBBY.code
+	then
+		return
+	end
 
 	local card_strings = PVP.UTILS.string_split(PVP.nemesis_deck_string, ";")
 
@@ -786,32 +798,35 @@ function G.FUNCS.load_nemesis_deck()
 		-- If invalid enhancement, edition, or seal, fallback to "none"
 		local front_key = tostring(suit) .. "_" .. tostring(rank)
 		if not G.P_CARDS[front_key] then
-			sendDebugMessage(string.format("Invalid playing card key: %s", front_key), "MULTIPLAYER")
+			PVP.match_log("debug", string.format("Invalid playing card key: %s", front_key))
 			goto continue
 		end
 		if not enhancement or (enhancement ~= "none" and not G.P_CENTERS[enhancement]) then
-			sendDebugMessage(string.format("Invalid enhancement: %s", enhancement), "MULTIPLAYER")
+			PVP.match_log("debug", string.format("Invalid enhancement: %s", enhancement))
 			enhancement = "none"
 		end
 		if not edition or (edition ~= "none" and not G.P_CENTERS["e_" .. edition]) then
-			sendDebugMessage(string.format("Invalid edition: %s", edition), "MULTIPLAYER")
+			PVP.match_log("debug", string.format("Invalid edition: %s", edition))
 			edition = "none"
 		end
 		if not seal or (seal ~= "none" and not G.P_SEALS[seal]) then
-			sendDebugMessage(string.format("Invalid seal: %s", seal), "MULTIPLAYER")
+			PVP.match_log("debug", string.format("Invalid seal: %s", seal))
 			seal = "none"
 		end
 
-		-- Create the card
-		local card = create_playing_card({
-			front = G.P_CARDS[front_key],
-			center = enhancement ~= "none" and G.P_CENTERS[enhancement] or nil,
-		}, PVP.nemesis_deck, true, true, nil, false)
+		-- A bare Card, not create_playing_card: the nemesis card must never join our own deck.
+		local area = PVP.nemesis_deck
+		local card = Card(
+			area.T.x,
+			area.T.y,
+			G.CARD_W,
+			G.CARD_H,
+			G.P_CARDS[front_key],
+			enhancement ~= "none" and G.P_CENTERS[enhancement] or G.P_CENTERS.c_base
+		)
+		area:emplace(card)
 		if edition ~= "none" then card:set_edition({ [edition] = true }, true, true) end
 		if seal ~= "none" then card:set_seal(seal, true, true) end
-
-		-- Remove the card from G.playing_cards and insert into PVP.nemesis_cards
-		table.remove(G.playing_cards, #G.playing_cards)
 		table.insert(PVP.nemesis_cards, card)
 
 		::continue::
@@ -820,7 +835,8 @@ end
 
 local function action_receive_nemesis_deck(p)
 	PVP.nemesis_deck_string = p.cards
-	PVP.nemesis_deck_received = true
+	-- A reply with no live deck area is not loaded, so it does not count as received.
+	PVP.nemesis_deck_received = PVP.nemesis_deck ~= nil and PVP.nemesis_deck.cards ~= nil
 	G.FUNCS.load_nemesis_deck()
 end
 
@@ -828,6 +844,15 @@ end
 -- by PVP.ACTIONS.start_ante_timer (passes fromNemesis = false explicitly).
 local function action_start_ante_timer(p)
 	if p.isPvP and (PVP.GAME.end_pvp or not PVP.is_pvp_boss() or G.GAME.current_round.hands_left <= 0) then return end
+	-- The opponent's ante timer, pressed as this player readied, can arrive after the
+	-- PvP started (its timers already reset): it would run as the PvP timer. Drop it.
+	local in_pvp = PVP.GAME.pvp_countdown_in_progress or (PVP.is_pvp_boss() and G.GAME.blind and G.GAME.blind.in_blind)
+	if not p.isPvP and p.fromNemesis ~= false and in_pvp then return end
+
+	-- One Ante timer per opponent: a second start while it runs would reset it.
+	if p.fromNemesis ~= false and PVP.GAME.nemesis_timer_started then return end
+	-- The same holds on the waiting side: its own timer already runs.
+	if p.fromNemesis == false and PVP.GAME.timer_started then return end
 
 	local time = p.time
 	local from_nemesis = p.fromNemesis
@@ -863,6 +888,12 @@ local function action_start_ante_timer(p)
 	else
 		PVP.GAME.timer_started = true
 	end
+end
+
+local function action_restart_ante_timer(p)
+	local time = p.time
+	if type(time) == "string" then time = tonumber(time) end
+	if time then PVP.AnteTimer.receive_restart(time, p.rejoined) end
 end
 
 local function action_pause_ante_timer(p)
@@ -927,7 +958,6 @@ function PVP.ACTIONS.leave_lobby()
 	Client.send({
 		action = "leaveLobby",
 	})
-	PVP.UTILS.emit_log_checksum()
 end
 
 function PVP.ACTIONS.start_game()
@@ -1133,6 +1163,7 @@ end
 -- Above the ruleset's timer threshold the opponent is told only when the timer
 -- falls to it (ui/game/timer.lua's Game:update).
 function PVP.ACTIONS.start_ante_timer()
+	if PVP.GAME.timer_started then return end
 	PVP.GAME.timer_threshold_pending = PVP.UTILS.timer_start_held_back(PVP.GAME.timer)
 	if not PVP.GAME.timer_threshold_pending then
 		PVP.ACTIONS.announce_ante_timer(PVP.GAME.timer)
@@ -1147,6 +1178,15 @@ function PVP.ACTIONS.pause_ante_timer()
 		time = PVP.GAME.timer,
 	})
 	action_pause_ante_timer({ time = PVP.GAME.timer, fromNemesis = false })
+end
+
+-- The timered side restarts its Ante timer after a run-out; the waiting side copies it.
+function PVP.ACTIONS.announce_ante_timer_restart(time, rejoined)
+	Client.send({
+		action = "restartAnteTimer",
+		time = time,
+		rejoined = rejoined or nil,
+	})
 end
 
 function PVP.ACTIONS.fail_timer()
@@ -1252,6 +1292,7 @@ local HANDLERS = {
 	nemesisEndGameStats = noop, -- logged only, no handler
 	startAnteTimer = action_start_ante_timer,
 	pauseAnteTimer = action_pause_ante_timer,
+	restartAnteTimer = action_restart_ante_timer,
 	moddedAction = action_modded_action,
 	error = action_error,
 	keepAlive = action_keep_alive,
@@ -1338,7 +1379,7 @@ function Game:update(dt)
 				then
 					log = log .. string.format(" (seed: %s) ", last_game_seed)
 				end
-				sendTraceMessage(log, "MULTIPLAYER")
+				PVP.match_log("trace", log)
 			end
 
 			local handler = HANDLERS[parsedAction.action]

@@ -378,7 +378,9 @@ function Game:update(dt)
             end
         -- Old, No-animations: lose a live when timered by opponent
         -- Pressure timers: lose a live regardless
-        elseif (is_pressure_timer or PVP.GAME.nemesis_timer_started) then
+        elseif PVP.GAME.nemesis_timer_started then
+            PVP.AnteTimer.on_run_out()
+        elseif is_pressure_timer then
             if PVP.GAME.timers_forgiven < PVP.LOBBY.config.timer_forgiveness then
                 PVP.GAME.timers_forgiven = PVP.GAME.timers_forgiven + 1
             else
@@ -408,27 +410,69 @@ function PVP.UI.restore_timer(amount, silent, max_timer)
 	end
 end
 
+-- Old timer: skip time covers only how far ahead of the opponent a player has
+-- skipped since the last PvP (as in 0.5). Skipping further ahead adds
+-- timer_increment_seconds; the opponent catching up takes it back (down to 10s),
+-- so when both skip, both timers end where they started. A ruleset with a display
+-- threshold (MLBa) keeps adding time for each of the player's own skips.
+function PVP.UI.update_matching_skip_timer(from_opponent)
+	local increment = PVP.LOBBY.config.timer_increment_seconds or 0
+	if
+		not PVP.LOBBY.config.timer
+		or increment <= 0
+		or PVP.is_any_layer_active({ "no_animation_timer", "pressure_timer" })
+	then
+		return
+	end
+	local threshold = PVP.UTILS.timer_display_threshold() > 0
+	local change = 0
+	if not threshold then
+		-- The baseline moves even while the gate below is closed, so a skip made
+		-- during a running timer is not paid out again later.
+		local diff = math.max((PVP.GAME.skips_before_pvp or 0) - (PVP.GAME.enemy.skips_before_pvp or 0), 0)
+		change = diff - (PVP.GAME.skips_difference or 0)
+		PVP.GAME.skips_difference = diff
+	end
+	if PVP.GAME.timer_started or PVP.GAME.nemesis_timer_started or PVP.GAME.timer_consumed then
+		return
+	end
+	if threshold then
+		if not from_opponent then PVP.UI.restore_timer(increment) end
+		return
+	end
+	if change > 0 then
+		PVP.UI.restore_timer(increment)
+	elseif change < 0 then
+		PVP.UI.consume_timer(math.min(increment, PVP.GAME.timer - 10), false, 10)
+	end
+end
+
 -- RLOG's play opcode is now recorded once, generically, by
 -- BalatroMultiplayerAPI/api/replay/generic_codes.lua's own
--- G.FUNCS.play_cards_from_highlighted hook -- this override stays only for
--- PvP's own timer-increment logic below.
+-- G.FUNCS.play_cards_from_highlighted hook -- this override stays for
+-- the double-play guard and PvP's own timer-increment logic below.
 local old_play = G.FUNCS.play_cards_from_highlighted
+-- A second Play before the first hand has been played is ignored (lib/play_lock.lua).
 function G.FUNCS.play_cards_from_highlighted(...)
-    old_play(...)
-    if G.play and G.play.cards[1] then return end
-    if PVP.LOBBY.code and PVP.LOBBY.config.timer and not PVP.GAME.timer_consumed then
-        if PVP.is_pvp_boss() then
-            -- PvP timer: Increment timer when hand is played during pvp
-            if PVP.is_layer_active("pvp_timer") then
-                local increment = PVP.LOBBY.config.pvp_timer_hand_played_increment_seconds or PVP.current_ruleset().pvp_timer_hand_played_increment_seconds or 0
-                PVP.UI.restore_timer(increment)
-            end
-        else
-            -- No-animation, Pressure timers: Increment timer when hand is played during regular blinds
-            if PVP.is_any_layer_active({ "no_animation_timer", "pressure_timer" }) then
-                local increment = PVP.LOBBY.config.timer_hand_played_increment_seconds or PVP.current_ruleset().timer_hand_played_increment_seconds or 0
-                PVP.UI.restore_timer(increment)
-            end
-        end
-    end
+	if not PVP.PlayLock.run(old_play, ...) then
+		return
+	end
+	if G.play and G.play.cards[1] then
+		return
+	end
+	if PVP.LOBBY.code and PVP.LOBBY.config.timer and not PVP.GAME.timer_consumed then
+		if PVP.is_pvp_boss() then
+			-- PvP timer: Increment timer when hand is played during pvp
+			if PVP.is_layer_active("pvp_timer") then
+				local increment = PVP.LOBBY.config.pvp_timer_hand_played_increment_seconds or PVP.current_ruleset().pvp_timer_hand_played_increment_seconds or 0
+				PVP.UI.restore_timer(increment)
+			end
+		else
+			-- No-animation, Pressure timers: Increment timer when hand is played during regular blinds
+			if PVP.is_any_layer_active({ "no_animation_timer", "pressure_timer" }) then
+				local increment = PVP.LOBBY.config.timer_hand_played_increment_seconds or PVP.current_ruleset().timer_hand_played_increment_seconds or 0
+				PVP.UI.restore_timer(increment)
+			end
+		end
+	end
 end
